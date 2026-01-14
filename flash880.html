@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RT-880 Web Serial Firmware Flasher</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f7f7f7;
+      color: #222;
+      margin: 0;
+      padding: 24px;
+    }
+    .card {
+      max-width: 640px;
+      margin: 0 auto;
+      background: #fff;
+      padding: 24px;
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 22px;
+    }
+    label {
+      display: block;
+      margin-top: 16px;
+      font-weight: 600;
+    }
+    select,
+    button,
+    input[type="file"] {
+      margin-top: 8px;
+    }
+    button {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      background: #2962ff;
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button[disabled] {
+      background: #9db3ff;
+      cursor: not-allowed;
+    }
+    .secondary {
+      background: #e53935;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+    .status {
+      margin-top: 16px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #f0f4ff;
+      min-height: 40px;
+    }
+    progress {
+      width: 100%;
+      height: 20px;
+      margin-top: 12px;
+    }
+    .hint {
+      font-size: 13px;
+      color: #555;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>RT-880 Web Serial Firmware Flasher</h1>
+
+    <label>Serial Connection</label>
+    <div class="row">
+      <button id="connectButton">Select Port</button>
+      <button id="disconnectButton" class="secondary" disabled>Disconnect</button>
+      <span id="portLabel">No port selected.</span>
+    </div>
+
+    <label for="modelSelect">Radio Model</label>
+    <select id="modelSelect">
+      <option value="rt800">Radtel RT-800</option>
+      <option value="uv98">iRadio UV-98</option>
+    </select>
+
+    <label for="firmwareFile">Firmware File (.bin)</label>
+    <input id="firmwareFile" type="file" accept=".bin" />
+    <div class="hint" id="fileLabel">No file selected.</div>
+
+    <div class="row" style="margin-top: 16px;">
+      <button id="flashButton" disabled>Flash Firmware</button>
+      <button id="abortButton" class="secondary" disabled>Abort</button>
+    </div>
+
+    <progress id="flashProgress" value="0" max="100"></progress>
+    <div class="status" id="statusText">Status: Ready</div>
+  </div>
+
+  <script>
+    const connectButton = document.getElementById("connectButton");
+    const disconnectButton = document.getElementById("disconnectButton");
+    const flashButton = document.getElementById("flashButton");
+    const abortButton = document.getElementById("abortButton");
+    const portLabel = document.getElementById("portLabel");
+    const modelSelect = document.getElementById("modelSelect");
+    const firmwareFileInput = document.getElementById("firmwareFile");
+    const fileLabel = document.getElementById("fileLabel");
+    const statusText = document.getElementById("statusText");
+    const flashProgress = document.getElementById("flashProgress");
+
+    let port = null;
+    let reader = null;
+    let writer = null;
+    let readBuffer = [];
+    let abortRequested = false;
+
+    const setStatus = (message) => {
+      statusText.textContent = `Status: ${message}`;
+    };
+
+    const updateProgress = (current, total) => {
+      const value = Math.max(0, Math.min(100, Math.round((current / total) * 100)));
+      flashProgress.value = value;
+      setStatus(`Progress: ${value}%`);
+    };
+
+    const getModelChecksumSeed = () => (modelSelect.selectedIndex === 1 ? 0x00 : 0x52);
+
+    const constructPacket = (type, address, data) => {
+      const count = data.length;
+      const packet = new Uint8Array(count + 4);
+      const checksumIndex = packet.length - 1;
+      packet[0] = type & 0xff;
+      packet[1] = (address >> 8) & 0xff;
+      packet[2] = address & 0xff;
+      packet.set(data, 3);
+      let checksum = getModelChecksumSeed();
+      for (let i = 0; i < checksumIndex; i += 1) {
+        checksum = (checksum + packet[i]) & 0xff;
+      }
+      packet[checksumIndex] = checksum;
+      return packet;
+    };
+
+    const readByte = async (timeoutMs) => {
+      if (readBuffer.length > 0) {
+        return readBuffer.shift();
+      }
+      const readPromise = reader.read().then(({ value, done }) => {
+        if (done || !value || value.length === 0) {
+          return null;
+        }
+        readBuffer = readBuffer.concat([...value]);
+        return readBuffer.shift();
+      });
+      const timeoutPromise = new Promise((resolve) => {
+        setTimeout(() => resolve("timeout"), timeoutMs);
+      });
+      return Promise.race([readPromise, timeoutPromise]);
+    };
+
+    const getAck = async () => {
+      const response = await readByte(5000);
+      if (response === 0x06) {
+        return true;
+      }
+      if (response === "timeout") {
+        setStatus("COM Port Timeout");
+      } else if (response === null) {
+        setStatus("COM Port Read Error/Abort");
+      } else {
+        setStatus("Bad Acknowledgement");
+      }
+      return false;
+    };
+
+    const writePacket = async (packet) => {
+      try {
+        await writer.write(packet);
+        return true;
+      } catch (error) {
+        setStatus("COM Port Write Error/Abort");
+        return false;
+      }
+    };
+
+    const openPort = async () => {
+      if (!port) {
+        return false;
+      }
+      if (!port.readable || !port.writable) {
+        await port.open({ baudRate: 115200, dataBits: 8, stopBits: 1, parity: "none" });
+      }
+      writer = port.writable.getWriter();
+      reader = port.readable.getReader();
+      readBuffer = [];
+      return true;
+    };
+
+    const closePort = async () => {
+      try {
+        if (reader) {
+          await reader.cancel();
+          reader.releaseLock();
+        }
+      } catch (error) {
+        // Ignore close errors.
+      }
+      try {
+        if (writer) {
+          writer.releaseLock();
+        }
+      } catch (error) {
+        // Ignore close errors.
+      }
+      reader = null;
+      writer = null;
+      if (port) {
+        try {
+          await port.close();
+        } catch (error) {
+          // Ignore close errors.
+        }
+      }
+    };
+
+    const padFirmware = (data) => {
+      const paddedLength = Math.ceil(data.length / 1024) * 1024;
+      const padded = new Uint8Array(paddedLength);
+      padded.set(data, 0);
+      return padded;
+    };
+
+    const flashFirmware = async (firmwareData) => {
+      abortRequested = false;
+      setStatus("Starting flash");
+      flashProgress.value = 0;
+      const padded = padFirmware(firmwareData);
+
+      if (!(await openPort())) {
+        setStatus("Cannot open port");
+        return;
+      }
+
+      try {
+        setStatus("Erasing Flash");
+        const eraseStageOne = constructPacket(0x39, 0x3305, new Uint8Array([0x10]));
+        if (!await writePacket(eraseStageOne) || !await getAck()) return;
+        if (!await writePacket(eraseStageOne) || !await getAck()) return;
+        const eraseStageTwo = constructPacket(0x39, 0x3305, new Uint8Array([0x55]));
+        if (!await writePacket(eraseStageTwo) || !await getAck()) return;
+
+        for (let offset = 0; offset < padded.length; offset += 1024) {
+          if (abortRequested) {
+            setStatus("Flash aborted");
+            return;
+          }
+          const chunk = padded.slice(offset, offset + 1024);
+          const packet = constructPacket(0x57, offset, chunk);
+          if (!await writePacket(packet) || !await getAck()) return;
+          updateProgress(offset, padded.length - 1024);
+        }
+        if (!await getAck()) return;
+        setStatus("Firmware Flash Finished Okay");
+      } finally {
+        await closePort();
+      }
+    };
+
+    connectButton.addEventListener("click", async () => {
+      try {
+        port = await navigator.serial.requestPort();
+        portLabel.textContent = "Port selected";
+        flashButton.disabled = !firmwareFileInput.files.length;
+        disconnectButton.disabled = false;
+        setStatus("Port selected");
+      } catch (error) {
+        setStatus("Port selection canceled");
+      }
+    });
+
+    disconnectButton.addEventListener("click", async () => {
+      await closePort();
+      port = null;
+      portLabel.textContent = "No port selected.";
+      flashButton.disabled = true;
+      disconnectButton.disabled = true;
+      setStatus("Disconnected");
+    });
+
+    firmwareFileInput.addEventListener("change", () => {
+      const file = firmwareFileInput.files[0];
+      if (file) {
+        fileLabel.textContent = file.name;
+        flashButton.disabled = !port;
+        setStatus("Firmware file selected");
+      } else {
+        fileLabel.textContent = "No file selected.";
+        flashButton.disabled = true;
+      }
+    });
+
+    flashButton.addEventListener("click", async () => {
+      const file = firmwareFileInput.files[0];
+      if (!port) {
+        setStatus("Please select a serial port.");
+        return;
+      }
+      if (!file) {
+        setStatus("Please select a firmware file.");
+        return;
+      }
+      flashButton.disabled = true;
+      abortButton.disabled = false;
+      connectButton.disabled = true;
+      firmwareFileInput.disabled = true;
+      modelSelect.disabled = true;
+      try {
+        const buffer = await file.arrayBuffer();
+        await flashFirmware(new Uint8Array(buffer));
+      } catch (error) {
+        setStatus("Error reading firmware file.");
+      } finally {
+        flashButton.disabled = false;
+        abortButton.disabled = true;
+        connectButton.disabled = false;
+        firmwareFileInput.disabled = false;
+        modelSelect.disabled = false;
+      }
+    });
+
+    abortButton.addEventListener("click", async () => {
+      abortRequested = true;
+      await closePort();
+      setStatus("Abort requested");
+    });
+
+    if (!("serial" in navigator)) {
+      connectButton.disabled = true;
+      flashButton.disabled = true;
+      setStatus("Web Serial API not available in this browser");
+    }
+  </script>
+</body>
+</html>
